@@ -4,7 +4,7 @@ name: Collecte des actualités
 # La branche est réécrite à chaque fois : le dépôt ne grossit pas.
 on:
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "12,42 * * * *"
   workflow_dispatch:
   push:
     branches: [main]
