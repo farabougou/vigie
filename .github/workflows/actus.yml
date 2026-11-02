@@ -1,0 +1,53 @@
+name: Collecte des actualités
+
+# Toutes les 30 minutes, lit la presse et publie actus.json sur la branche "donnees".
+# La branche est réécrite à chaque fois : le dépôt ne grossit pas.
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/collecter-actus.mjs"
+      - ".github/workflows/actus.yml"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: collecte-actus
+  cancel-in-progress: false
+
+jobs:
+  collecter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Récupérer les articles déjà collectés
+        run: curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/donnees/actus.json" -o anciens.json || echo '{}' > anciens.json
+
+      - name: Lire la presse
+        run: node scripts/collecter-actus.mjs anciens.json actus.json
+
+      - name: Publier sur la branche donnees
+        run: |
+          mkdir publication
+          cp actus.json publication/
+          cd publication
+          git init -q -b donnees
+          git config user.name "vigie-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add actus.json
+          git commit -q -m "Actualités du $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" donnees
+
+      # GitHub suspend les tâches planifiées après 60 jours sans activité : on la réactive à chaque passage.
+      - name: Garder la collecte active
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/actus.yml/enable"
