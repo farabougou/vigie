@@ -288,6 +288,7 @@ const CONFIG = {
   rafraichir: { usgs: 2 * 60e3, eonet: 15 * 60e3, gdacs: 15 * 60e3, gdelt: 10 * 60e3, conditions: 30 * 60e3 },
   ecartGdelt: 6e3,      // GDELT demande au moins 5 secondes entre deux appels
   delaiMax: 20e3,       // au-delà, on considère que la source ne répond pas
+  delaiGdelt: 30e3,     // GDELT peut être lent quand il est très sollicité
   ancienUsgs: 60 * 60e3,        // un flux USGS de plus d'une heure est signalé
   ancienEonet: 10 * 24 * 60 * 60e3, // aucun relevé NASA depuis 10 jours : signalé
   repereOmsPm10: 45,    // valeur guide de l'OMS (2021) pour les PM10 sur 24 heures, en µg/m³
@@ -420,6 +421,10 @@ const etat = {
   evenements: [],
   articles: [],
   actusEnCours: true,
+  actusRecherche: "Recherche des articles…",
+  actusAvis: null,
+  actusPeriode: null,
+  actusErreur: null,
   conditions: null,
   couches: Object.fromEntries(Object.keys(COUCHES).map((c) => [c, true])),
   sources: {
@@ -498,10 +503,10 @@ function rayon(m) {
 /* Lit une adresse et renvoie son statut et son texte, avec une durée maximale.
    La minuterie n'utilise pas de signal d'annulation : certains aperçus intégrés à une application
    remplacent fetch et refusent ce signal (erreur DataCloneError). */
-async function lire(url) {
+async function lire(url, dureeMax = CONFIG.delaiMax) {
   let minuteur;
   const delai = new Promise((_, refuser) => {
-    minuteur = setTimeout(() => refuser(new Error("délai dépassé")), CONFIG.delaiMax);
+    minuteur = setTimeout(() => refuser(new Error("délai dépassé")), dureeMax);
   });
   const appel = fetch(url).then(async (rep) => ({ ok: rep.ok, status: rep.status, texte: await rep.text() }));
   try {
@@ -743,19 +748,44 @@ function demanderActus() {
   jetonActus++;
   etat.articles = [];
   etat.actusEnCours = true;
+  etat.actusRecherche = "Recherche des articles…";
+  etat.actusAvis = null;
+  etat.actusPeriode = null;
+  etat.actusErreur = null;
   afficherListe();
   const attente = Math.max(0, dernierAppelGdelt + CONFIG.ecartGdelt - Date.now());
   minuteurActus = setTimeout(() => chargerActus(), attente);
 }
 
-function requeteActus() {
+/* Du plus précis au plus large : si rien n'est trouvé, on élargit plutôt que d'afficher une page vide.
+   Les mots-clés restent en anglais : GDELT cherche ainsi dans ses 65 langues traduites. */
+function etapesActus() {
   const z = etat.zone;
-  let q = z.requete;
-  if (etat.langue === "presse" && z.presse) q = z.presse;
-  else if (etat.langue === "fr") q += " sourcelang:french";
-  /* La presse locale publie moins : on regarde sur trois jours. */
-  const duree = etat.langue === "presse" ? "3d" : "24h";
-  return `${CONFIG.gdelt}?query=${encodeURIComponent(q)}&mode=ArtList&format=json&maxrecords=40&timespan=${duree}&sort=DateDesc`;
+  if (etat.langue === "presse" && z.presse) {
+    return [
+      { q: z.presse, duree: "3d", periode: "3 derniers jours" },
+      { q: z.presse, duree: "14d", periode: "14 derniers jours", avis: "Peu d’articles récents : voici ceux des 14 derniers jours." },
+    ];
+  }
+  const toutes = [
+    { q: z.requete, duree: "24h", periode: "dernières 24 heures" },
+    { q: z.requete, duree: "7d", periode: "7 derniers jours" },
+  ];
+  if (etat.langue !== "fr") {
+    toutes[1].avis = "Peu d’articles récents : voici ceux des 7 derniers jours.";
+    return toutes;
+  }
+  const fr = z.requete + " sourcelang:french";
+  return [
+    { q: fr, duree: "24h", periode: "dernières 24 heures" },
+    { q: fr, duree: "7d", periode: "7 derniers jours", avis: "Rien en français sur 24 heures : voici les articles des 7 derniers jours." },
+    { ...toutes[0], avis: "Rien en français pour le moment : voici les articles dans toutes les langues." },
+    { ...toutes[1], avis: "Rien en français pour le moment : voici les articles des 7 derniers jours, dans toutes les langues." },
+  ];
+}
+
+function adresseActus(etape) {
+  return `${CONFIG.gdelt}?query=${encodeURIComponent(etape.q)}&mode=ArtList&format=json&maxrecords=40&timespan=${etape.duree}&sort=DateDesc`;
 }
 
 function dateGdelt(s) {
@@ -763,35 +793,76 @@ function dateGdelt(s) {
   return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : 0;
 }
 
-async function chargerActus(essai = 1) {
+/* Un titre de GDELT contient parfois des caractères qui cassent le JSON et feraient perdre toute la liste.
+   On répare, et en dernier recours on récupère les articles un par un. */
+function lireArticles(texte) {
+  const nettoyer = (t) => t
+    .replace(/[\u0000-\u001f]/g, " ")
+    .replace(/\\u(?![0-9a-fA-F]{4})/g, "")
+    .replace(/\\(.)/g, (tout, c) => ('"\\/bfnrtu'.includes(c) ? tout : c));
+  let liste = null;
+  for (const version of [texte, nettoyer(texte)]) {
+    try {
+      liste = JSON.parse(version).articles || [];
+      break;
+    } catch { /* essai suivant */ }
+  }
+  if (!liste) {
+    liste = [];
+    for (const morceau of nettoyer(texte).match(/\{[^{}]*\}/g) || []) {
+      try {
+        const article = JSON.parse(morceau);
+        if (article.url) liste.push(article);
+      } catch { /* cet article reste illisible, on garde les autres */ }
+    }
+    if (!liste.length) throw new Error("réponse illisible");
+  }
+  const vus = new Set();
+  return liste
+    .filter((a) => {
+      const url = lienSur(a.url);
+      if (!a.title || !url || vus.has(a.title)) return false;
+      vus.add(a.title);
+      return true;
+    })
+    .map((a) => ({ titre: a.title, url: lienSur(a.url), media: a.domain || "", temps: dateGdelt(a.seendate) }));
+}
+
+async function chargerActus(numero = 0, essai = 1) {
   const jeton = ++jetonActus;
   dernierAppelGdelt = Date.now();
+  const etapes = etapesActus();
+  const etape = etapes[numero];
   try {
-    const rep = await lire(requeteActus());
-    const texte = rep.texte;
+    const rep = await lire(adresseActus(etape), CONFIG.delaiGdelt);
     if (jeton !== jetonActus) return; // la zone a changé entre-temps
-    if (rep.status === 429 || /limit requests/i.test(texte)) throw new Error("trop d'appels");
-    if (!rep.ok) throw new Error("HTTP " + rep.status);
-    const debut = texte.trimStart();
-    if (!debut.startsWith("{")) throw new Error("réponse illisible : " + debut.slice(0, 80));
-    const vus = new Set();
-    etat.articles = (JSON.parse(texte).articles || [])
-      .filter((a) => {
-        const url = lienSur(a.url);
-        if (!a.title || !url || vus.has(a.title)) return false;
-        vus.add(a.title);
-        return true;
-      })
-      .map((a) => ({ titre: a.title, url: lienSur(a.url), media: a.domain || "", temps: dateGdelt(a.seendate) }));
+    if (rep.status === 429 || /limit requests/i.test(rep.texte)) throw new Error("GDELT limite le nombre d’appels");
+    if (!rep.ok) throw new Error("GDELT a répondu avec le code " + rep.status);
+    const debut = rep.texte.trimStart();
+    if (debut && !debut.startsWith("{")) throw new Error("GDELT a répondu : " + debut.slice(0, 120));
+    const articles = debut ? lireArticles(rep.texte) : [];
+    /* Rien trouvé : on passe à la recherche plus large, en respectant l'écart entre deux appels. */
+    if (!articles.length && numero + 1 < etapes.length && !etat.articles.length) {
+      etat.actusRecherche = "Rien pour l’instant, recherche élargie…";
+      afficherListe();
+      minuteurActus = setTimeout(() => chargerActus(numero + 1), CONFIG.ecartGdelt);
+      return;
+    }
+    etat.articles = articles;
+    etat.actusPeriode = etape.periode;
+    etat.actusAvis = articles.length ? etape.avis || null : null;
+    etat.actusErreur = null;
     marquer("gdelt", "ok");
     etat.actusEnCours = false;
   } catch (e) {
     if (jeton !== jetonActus) return;
     console.warn("GDELT :", e);
-    if (essai < 2) {
-      minuteurActus = setTimeout(() => chargerActus(essai + 1), CONFIG.ecartGdelt);
+    /* Quatre essais, de plus en plus espacés : GDELT refuse souvent les appels quand il est sollicité. */
+    if (essai < 4) {
+      minuteurActus = setTimeout(() => chargerActus(numero, essai + 1), CONFIG.ecartGdelt * essai);
       return;
     }
+    etat.actusErreur = e instanceof TypeError ? `connexion impossible (${e.message})` : e.message;
     marquer("gdelt", "erreur", "ne répond pas");
     etat.actusEnCours = false;
   }
@@ -1307,7 +1378,7 @@ function afficherListe() {
   contenu.setAttribute("aria-labelledby", "onglet-" + etat.onglet);
   const indice = etat.zone.cle.startsWith("pays:") ? "" : " Choisis un pays sur la carte.";
   $("sous-titre").textContent = {
-    actus: etat.langue === "presse" ? "Articles des 3 derniers jours." : "Articles des dernières 24 heures.",
+    actus: `Articles des ${etat.actusPeriode || (etat.langue === "presse" ? "3 derniers jours" : "dernières 24 heures")}.`,
     seismes: "Magnitude 2,5 et plus, 7 derniers jours.",
     evenements: "Événements en cours, selon GDACS et la NASA.",
   }[etat.onglet] + indice;
@@ -1359,17 +1430,16 @@ function listeEvenements(lignes) {
 
 function listeActus() {
   const s = etat.sources.gdelt;
-  if (etat.actusEnCours) return [el("li", { class: "message" }, "Recherche des articles…")];
+  if (etat.actusEnCours) return [el("li", { class: "message" }, etat.actusRecherche)];
   if (s.statut === "erreur" && !etat.articles.length) {
-    return [message("Le fil d’actualité ne répond pas", "GDELT n’a pas envoyé d’articles. La carte et les autres données continuent de fonctionner.", el("button", { type: "button", onclick: demanderActus }, "Réessayer"))];
+    return [message("Le fil d’actualité ne répond pas", `GDELT n’a pas envoyé d’articles. La carte et les autres données continuent de fonctionner. Détail : ${etat.actusErreur}.`, el("button", { type: "button", onclick: demanderActus }, "Réessayer"))];
   }
   if (!etat.articles.length) {
-    if (etat.langue !== "toutes") {
-      return [message("Aucun article trouvé", `Aucun résultat ${etat.zone.ici} avec ce filtre.`, el("button", { type: "button", onclick: () => changerLangue("toutes") }, "Voir toutes les langues"))];
-    }
-    return [message("Aucun article trouvé", `Aucun résultat ${etat.zone.ici} ces dernières 24 heures.`)];
+    return [message("Aucun article trouvé", `Aucun résultat ${etat.zone.ici}, même sur les 7 derniers jours.`, etat.langue !== "toutes" ? el("button", { type: "button", onclick: () => changerLangue("toutes") }, "Voir toutes les langues") : null)];
   }
-  const avis = s.statut === "erreur" ? [el("li", { class: "avis" }, `GDELT ne répond plus. Articles reçus le ${dateComplete.format(s.maj)}.`)] : [];
+  const avis = [];
+  if (s.statut === "erreur") avis.push(el("li", { class: "avis" }, `GDELT ne répond plus. Articles reçus le ${dateComplete.format(s.maj)}.`));
+  if (etat.actusAvis) avis.push(el("li", { class: "avis" }, etat.actusAvis));
   return avis.concat(etat.articles.map(ligneArticle));
 }
 
