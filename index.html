@@ -281,11 +281,14 @@ const CONFIG = {
   usgs: "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_week.geojson",
   eonet: "https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=500",
   gdacs: "https://www.gdacs.org/gdacsapi/api/events/geteventlist/EVENTS4APP",
-  gdelt: "https://api.gdeltproject.org/api/v2/doc/doc",
+  presse: "https://raw.githubusercontent.com/farabougou/vigie/donnees/actus.json", // collecte de ce dépôt, toutes les 30 minutes
+  gdelt: "https://api.gdeltproject.org/api/v2/doc/doc", // secours, si la collecte n'a rien sur un pays
   meteo: "https://api.open-meteo.com/v1/forecast",
   air: "https://air-quality-api.open-meteo.com/v1/air-quality",
   fleuve: "https://flood-api.open-meteo.com/v1/flood",
-  rafraichir: { usgs: 2 * 60e3, eonet: 15 * 60e3, gdacs: 15 * 60e3, gdelt: 10 * 60e3, conditions: 30 * 60e3 },
+  rafraichir: { usgs: 2 * 60e3, eonet: 15 * 60e3, gdacs: 15 * 60e3, presse: 10 * 60e3, conditions: 30 * 60e3 },
+  anciennePresse: 3 * 60 * 60e3, // une collecte de plus de 3 heures est signalée
+  articlesAffiches: 60,
   ecartGdelt: 6e3,      // GDELT demande au moins 5 secondes entre deux appels
   delaiMax: 20e3,       // au-delà, on considère que la source ne répond pas
   delaiGdelt: 30e3,     // GDELT peut être lent quand il est très sollicité
@@ -425,10 +428,12 @@ const etat = {
   actusAvis: null,
   actusPeriode: null,
   actusErreur: null,
+  presse: null,
+  gdelt: { statut: "attente", maj: null },
   conditions: null,
   couches: Object.fromEntries(Object.keys(COUCHES).map((c) => [c, true])),
   sources: {
-    gdelt: { nom: "The GDELT Project", role: "Actualités", site: "https://www.gdeltproject.org/", statut: "attente", maj: null, detail: "" },
+    presse: { nom: "Presse", role: "Actualités", site: "https://github.com/farabougou/vigie", statut: "attente", maj: null, detail: "" },
     gdacs: { nom: "GDACS", role: "Alertes", site: "https://www.gdacs.org/", statut: "attente", maj: null, detail: "" },
     eonet: { nom: "NASA EONET", role: "Événements", site: "https://eonet.gsfc.nasa.gov/", statut: "attente", maj: null, detail: "" },
     usgs: { nom: "USGS", role: "Séismes", site: "https://earthquake.usgs.gov/", statut: "attente", maj: null, detail: "" },
@@ -604,7 +609,7 @@ function construireAtlas(topo) {
     if (!fr && code && noms) { try { fr = noms.of(code); } catch { /* code inconnu du navigateur */ } }
     fr = fr || nom;
     const recherche = RECHERCHE_PAYS[nom] || nom.replace(/ Is\.$/, " Islands").replace(/^St\. /, "Saint ");
-    const pays = { cid: nom, fr, recherche, morceaux: morceauxDe(f.geometry) };
+    const pays = { cid: nom, fr, code, recherche, morceaux: morceauxDe(f.geometry) };
     paysParNom.set(nom, pays);
     if (code && !parCode.has(code)) parCode.set(code, pays);
     f.properties = { cid: nom, fr, afrique: AFRIQUE.includes(code) || nom === "Somaliland" };
@@ -742,17 +747,77 @@ let dernierAppelGdelt = 0;
 let jetonActus = 0;
 let minuteurActus = null;
 
-/* Respecte l'écart imposé par GDELT : seule la dernière demande est envoyée. */
+/* ===== Source : presse collectée par ce dépôt ===== */
+async function chargerPresse() {
+  try {
+    const donnees = await lireJson(CONFIG.presse);
+    etat.presse = {
+      genere: donnees.genere,
+      medias: (donnees.medias || []).filter((m) => !m.erreur).length,
+      articles: (donnees.articles || []).filter((a) => a.t && lienSur(a.u)),
+    };
+    const nombre = `${etat.presse.medias} médias`;
+    if (Date.now() - donnees.genere > CONFIG.anciennePresse) marquer("presse", "ancien", "collecte figée " + ilYa(donnees.genere));
+    else marquer("presse", "ok", nombre);
+  } catch (e) {
+    console.warn("Presse :", e);
+    marquer("presse", "erreur", "ne répond pas");
+  }
+  demanderActus();
+  afficherTout();
+}
+
+const expressionMot = (mot) => new RegExp(`(?<![\\p{L}\\p{N}])${mot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`, "iu");
+
+/* Articles de la zone suivie. Pour un pays hors d'Afrique, on cherche son nom dans les titres. */
+function articlesDeLaZone() {
+  const z = etat.zone;
+  const tous = etat.presse?.articles || [];
+  if (z.cle === "monde") return tous;
+  const codes = new Set(z.codes || []);
+  const noms = z.motsTitre ? z.motsTitre.map(expressionMot) : [];
+  return tous.filter((a) => (a.p || []).some((c) => codes.has(c)) || noms.some((n) => n.test(a.t)));
+}
+
+/* Applique le filtre choisi. S'il n'y a rien en français, on montre les autres langues plutôt qu'une page vide. */
+function articlesFiltres() {
+  const z = etat.zone;
+  const zone = articlesDeLaZone();
+  const enCarte = (a) => ({ titre: a.t, url: lienSur(a.u), media: a.m, temps: a.d });
+  const garder = (liste) => liste.slice(0, CONFIG.articlesAffiches).map(enCarte);
+  if (etat.langue === "presse" && z.presse) {
+    const origines = new Set(z.cle === "afrique" ? [...AFRIQUE, "AF"] : z.codes);
+    return { articles: garder((etat.presse?.articles || []).filter((a) => origines.has(a.o))), avis: null };
+  }
+  if (etat.langue === "fr") {
+    const fr = zone.filter((a) => a.l === "fr");
+    if (fr.length) return { articles: garder(fr), avis: null };
+    return { articles: garder(zone), avis: zone.length ? "Rien en français pour le moment : voici les articles dans les autres langues." : null };
+  }
+  return { articles: garder(zone), avis: null };
+}
+
+/* La presse collectée répond tout de suite. GDELT n'est appelé que si elle n'a rien sur la zone.
+   Dans ce cas, on respecte l'écart imposé par GDELT : seule la dernière demande est envoyée. */
 function demanderActus() {
   clearTimeout(minuteurActus);
   jetonActus++;
-  etat.articles = [];
-  etat.actusEnCours = true;
-  etat.actusRecherche = "Recherche des articles…";
   etat.actusAvis = null;
   etat.actusPeriode = null;
   etat.actusErreur = null;
+  const locaux = articlesFiltres();
+  if (locaux.articles.length) {
+    etat.articles = locaux.articles;
+    etat.actusAvis = locaux.avis;
+    etat.actusEnCours = false;
+    afficherListe();
+    return;
+  }
+  etat.articles = [];
+  etat.actusEnCours = true;
+  etat.actusRecherche = "Recherche des articles…";
   afficherListe();
+  if (etat.sources.presse.statut === "attente") return; // la presse arrive, on l'attend
   const attente = Math.max(0, dernierAppelGdelt + CONFIG.ecartGdelt - Date.now());
   minuteurActus = setTimeout(() => chargerActus(), attente);
 }
@@ -852,7 +917,7 @@ async function chargerActus(numero = 0, essai = 1) {
     etat.actusPeriode = etape.periode;
     etat.actusAvis = articles.length ? etape.avis || null : null;
     etat.actusErreur = null;
-    marquer("gdelt", "ok");
+    etat.gdelt = { statut: "ok", maj: Date.now() };
     etat.actusEnCours = false;
   } catch (e) {
     if (jeton !== jetonActus) return;
@@ -863,7 +928,7 @@ async function chargerActus(numero = 0, essai = 1) {
       return;
     }
     etat.actusErreur = e instanceof TypeError ? `connexion impossible (${e.message})` : e.message;
-    marquer("gdelt", "erreur", "ne répond pas");
+    etat.gdelt = { statut: "erreur", maj: etat.gdelt.maj };
     etat.actusEnCours = false;
   }
   afficherTout();
@@ -1239,6 +1304,8 @@ function choisirPays(cid) {
     nom: pays.fr,
     ici: "dans ce pays",
     pays: [pays],
+    codes: pays.code ? [pays.code] : [],
+    motsTitre: [pays.fr, pays.recherche.startsWith("(") ? null : pays.recherche].filter(Boolean),
     requete: pays.recherche.startsWith("(") ? pays.recherche : `"${pays.recherche}"`,
   });
   const [x0, y0, x1, y1] = cadrePrincipal(pays);
@@ -1289,7 +1356,7 @@ function afficherCouches() {
 
 function afficherOnglets(n) {
   const onglets = [
-    ["actus", "Actualités", etat.actusEnCours ? "…" : etat.sources.gdelt.statut === "erreur" && !etat.articles.length ? "–" : etat.articles.length],
+    ["actus", "Actualités", etat.actusEnCours ? "…" : etat.gdelt.statut === "erreur" && !etat.articles.length ? "–" : etat.articles.length],
     ["seismes", "Séismes", nombreSource(["usgs"], n.seismes.length)],
     ["evenements", "Événements", nombreSource(["eonet", "gdacs"], n.evenements.length)],
   ];
@@ -1378,7 +1445,7 @@ function afficherListe() {
   contenu.setAttribute("aria-labelledby", "onglet-" + etat.onglet);
   const indice = etat.zone.cle.startsWith("pays:") ? "" : " Choisis un pays sur la carte.";
   $("sous-titre").textContent = {
-    actus: `Articles des ${etat.actusPeriode || (etat.langue === "presse" ? "3 derniers jours" : "dernières 24 heures")}.`,
+    actus: etat.actusPeriode ? `Articles des ${etat.actusPeriode}.` : `Derniers articles${etat.presse?.medias ? `, ${etat.presse.medias} médias suivis` : ""}.`,
     seismes: "Magnitude 2,5 et plus, 7 derniers jours.",
     evenements: "Événements en cours, selon GDACS et la NASA.",
   }[etat.onglet] + indice;
@@ -1429,16 +1496,18 @@ function listeEvenements(lignes) {
 }
 
 function listeActus() {
-  const s = etat.sources.gdelt;
+  const s = etat.gdelt;
   if (etat.actusEnCours) return [el("li", { class: "message" }, etat.actusRecherche)];
   if (s.statut === "erreur" && !etat.articles.length) {
-    return [message("Le fil d’actualité ne répond pas", `GDELT n’a pas envoyé d’articles. La carte et les autres données continuent de fonctionner. Détail : ${etat.actusErreur}.`, el("button", { type: "button", onclick: demanderActus }, "Réessayer"))];
+    return [message("Le fil d’actualité ne répond pas", `Ni la presse collectée ni GDELT n’ont envoyé d’articles. La carte et les autres données continuent de fonctionner. Détail : ${etat.actusErreur}.`, el("button", { type: "button", onclick: demanderActus }, "Réessayer"))];
   }
   if (!etat.articles.length) {
     return [message("Aucun article trouvé", `Aucun résultat ${etat.zone.ici}, même sur les 7 derniers jours.`, etat.langue !== "toutes" ? el("button", { type: "button", onclick: () => changerLangue("toutes") }, "Voir toutes les langues") : null)];
   }
   const avis = [];
-  if (s.statut === "erreur") avis.push(el("li", { class: "avis" }, `GDELT ne répond plus. Articles reçus le ${dateComplete.format(s.maj)}.`));
+  if (s.statut === "erreur" && !etat.presse?.articles.length) avis.push(el("li", { class: "avis" }, `GDELT ne répond plus. Articles reçus le ${dateComplete.format(s.maj)}.`));
+  const presse = avisSource("presse");
+  if (presse) avis.push(presse);
   if (etat.actusAvis) avis.push(el("li", { class: "avis" }, etat.actusAvis));
   return avis.concat(etat.articles.map(ligneArticle));
 }
@@ -1508,7 +1577,7 @@ function afficherSources() {
   $("lignes-sources").replaceChildren(
     ...ordre.map((s) => {
       const texte = s.statut === "attente" ? "en attente"
-        : s.statut === "ok" ? "à jour, " + ilYa(s.maj)
+        : s.statut === "ok" ? (s === etat.sources.presse ? `${s.detail}, collecte ${ilYa(etat.presse.genere)}` : "à jour, " + ilYa(s.maj))
         : s.detail;
       return el("div", {},
         el("i", { class: "point " + s.statut }),
@@ -1516,11 +1585,11 @@ function afficherSources() {
         el("span", { class: "etat" }, texte));
     }));
   /* Chaque source reste créditée en permanence, même quand le détail est replié. */
-  $("credits").replaceChildren("Données : ",
+  $("credits").replaceChildren("Les titres renvoient vers les articles de chaque média. Données : ",
     lienExterne(etat.sources.usgs.site, "U.S. Geological Survey"), ", ",
     lienExterne(etat.sources.eonet.site, "NASA EONET"), ", ",
     lienExterne(etat.sources.gdacs.site, "GDACS"), ", ",
-    lienExterne(etat.sources.gdelt.site, "The GDELT Project"), ", ",
+    lienExterne("https://www.gdeltproject.org/", "The GDELT Project"), ", ",
     lienExterne(etat.sources.conditions.site, "Open-Meteo"), " (CC BY 4.0, modèles CAMS et GloFAS). Carte : ",
     lienExterne("https://www.naturalearthdata.com/", "Natural Earth"), " et ",
     lienExterne("https://maplibre.org/", "MapLibre"),
@@ -1585,16 +1654,16 @@ ameliorerAtlas();
 chargerSeismes();
 chargerEonet();
 chargerGdacs();
-chargerActus();
+chargerPresse();
 chargerConditions();
 
 /* Mises à jour : seulement quand la page est visible, pour économiser les données mobiles. */
-const derniers = { usgs: Date.now(), eonet: Date.now(), gdacs: Date.now(), gdelt: Date.now(), conditions: Date.now() };
+const derniers = { usgs: Date.now(), eonet: Date.now(), gdacs: Date.now(), presse: Date.now(), conditions: Date.now() };
 const chargeurs = {
   usgs: chargerSeismes,
   eonet: chargerEonet,
   gdacs: chargerGdacs,
-  gdelt: () => { if (Date.now() - dernierAppelGdelt > CONFIG.ecartGdelt) chargerActus(); },
+  presse: chargerPresse,
   conditions: chargerConditions,
 };
 setInterval(() => {
